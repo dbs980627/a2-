@@ -1,10 +1,3 @@
-# 기술 설계
-
-> 이 문서는 실제 소스 코드를 기준으로 작성했다. 이전 검토에서 지적된
-> "페르소나 반영 없음", "톤 가드레일 없음", "검증/재생성 루프 없음",
-> "401/403이 502/503/504와 같이 재시도됨", "실패 이력 미기록" 문제를
-> 실제 코드에 반영해 해소했다. 문서의 모든 서술은 아래 코드와 정확히 대응한다.
-
 ## 1. 시스템 아키텍처
 
 브랜드 브리프를 입력받아 `네이밍 → 슬로건 → 브랜드 스토리 → 컬러 팔레트 → 로고 시안`을
@@ -95,28 +88,59 @@ def _record_failure(result: dict, stage: str, error: Exception, message_prefix: 
 - **400/401/403 (`FATAL_STATUS`)**: 재시도로 해결되지 않는 오류이므로 **즉시 `RuntimeError`를
   던지고 재시도하지 않는다.**
 - **502/503/504 (`RETRYABLE_STATUS`)**: 서버 일시 과부하로 간주해 재시도한다. 대기 시간은
-  `attempt * 3`초로 **선형 증가**한다(3초 → 6초 → 9초 → 12초). `max_retries`(기본 4회) 안에
+  `attempt * 3`초로 **선형 증가**한다(3초 → 6초 → 9초). `max_retries`(기본 4회) 안에
   성공하지 못하면 `RuntimeError`를 던진다.
-- **그 외 requests 예외**(타임아웃, 연결 오류 등): 마지막 시도가 아니면 동일하게 `attempt * 3`초
-  대기 후 재시도, 마지막 시도면 `RuntimeError`로 변환해 던진다.
+- **그 외 requests 예외**(타임아웃, 연결 오류, 그리고 `FATAL_STATUS`·`RETRYABLE_STATUS`에
+  속하지 않는 상태 코드에서 `raise_for_status()`가 던지는 `HTTPError` 포함): 마지막 시도가
+  아니면 동일하게 `attempt * 3`초 대기 후 재시도, 마지막 시도면 `RuntimeError`로 변환해 던진다.
 - **JSON 파싱 실패**: 코드블록 기호(` ```json `)를 정규식으로 제거한 뒤 `json.loads()`를
   시도하고, 실패하면 `ValueError`로 원본 응답 일부(300자)와 함께 던진다.
 
 ```python
 RETRYABLE_STATUS = (502, 503, 504)
 FATAL_STATUS = (400, 401, 403)
-...
-if response.status_code in FATAL_STATUS:
-    raise RuntimeError(f"LLM API 호출 실패(재시도 불가): HTTP {response.status_code} ...")
-if response.status_code in RETRYABLE_STATUS:
-    wait = attempt * 3
-    time.sleep(wait)
-    continue
+
+for attempt in range(1, max_retries + 1):
+    try:
+        response = requests.post(...)
+
+        if response.status_code in FATAL_STATUS:
+            raise RuntimeError(
+                f"LLM API 호출 실패(재시도 불가): HTTP {response.status_code} "
+                f"- {response.text[:200]}"
+            )
+
+        if response.status_code in RETRYABLE_STATUS:
+            wait = attempt * 3
+            time.sleep(wait)
+            continue
+
+        response.raise_for_status()
+        break
+
+    except RuntimeError:
+        # FATAL_STATUS에서 위로 던진 RuntimeError는 재시도 경로를 타지 않고 그대로 전파한다.
+        raise
+
+    except requests.exceptions.RequestException as e:
+        if attempt == max_retries:
+            raise RuntimeError(f"LLM API 호출 실패: {e}")
+        time.sleep(attempt * 3)
+else:
+    # for가 break 없이 끝남 = 계속 RETRYABLE_STATUS였음
+    raise RuntimeError(f"LLM API 호출 실패: {max_retries}회 재시도 후에도 서버 오류")
 ```
 
+`except RuntimeError: raise` 분기를 별도로 둔 이유: `FATAL_STATUS`에서 던진 `RuntimeError`는
+`requests.exceptions.RequestException`의 하위 클래스가 아니라서 바로 아래 `except` 절에
+잡히지는 않지만, 두 `except` 절의 의도(재시도 불가 vs 재시도 가능)를 코드 구조로도 명확히
+드러내고 향후 예외 계층이 바뀌어도 FATAL 경로가 실수로 재시도 경로에 섞이지 않도록 명시적으로
+분리해뒀다.
+
 이전 버전에서는 `raise_for_status()`가 던지는 `HTTPError`가 `RequestException`의 하위
-클래스라는 이유로 401/403도 502/503/504와 같은 재시도 경로를 탔다. 인증 실패는 몇 번을 다시
-호출해도 결과가 같으므로, 이번에 상태 코드 체크 순서를 바꿔 즉시 실패 경로로 분리했다.
+클래스라는 이유로 401/403도 502/503/504와 같은 재시도 경로를 탔다. 인증 실패나 잘못된 요청은
+몇 번을 다시 호출해도 결과가 같으므로, 상태 코드 체크 순서를 `FATAL_STATUS` → `RETRYABLE_STATUS`
+→ 그 외(`raise_for_status()`) 순으로 재배치해 즉시 실패 경로를 분리했다.
 
 `main.py`는 `RuntimeError`/`ValueError` 두 타입만 잡도록 설계돼 있어 위 정책과 정확히
 맞물린다.
